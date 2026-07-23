@@ -1,0 +1,47 @@
+from __future__ import annotations
+
+import os
+
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+
+from src.api.errors import (
+    loan_not_found_handler,
+    unhandled_exception_handler,
+    validation_exception_handler,
+)
+from src.api.routes import router
+from src.domain.models import LoanNotFoundError
+from src.domain.rules import RulesConfig
+from src.repository.db import Database
+from src.repository.loan_repository import LoanRepository
+from src.services.loan_service import LoanService
+
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "bankflow.db")
+DEFAULT_RULES_PATH = os.path.join(os.path.dirname(__file__), "config", "rules.json")
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="BankFlow Loan Processing System", version="1.0.0")
+
+    db_path = os.environ.get("BANKFLOW_DB_PATH", DEFAULT_DB_PATH)
+    rules_path = os.environ.get("BANKFLOW_RULES_PATH", DEFAULT_RULES_PATH)
+
+    database = Database(db_path)
+    repository = LoanRepository(database)
+    rules = RulesConfig.load(rules_path)
+    loan_service = LoanService(repository, rules)
+
+    app.state.database = database
+    app.state.loan_service = loan_service
+
+    app.include_router(router)
+
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(LoanNotFoundError, loan_not_found_handler)
+    app.add_exception_handler(Exception, unhandled_exception_handler)
+
+    return app
+
+
+app = create_app()

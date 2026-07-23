@@ -1,0 +1,109 @@
+from src.domain.models import Loan, LoanStatus, LoanType, Stage
+from src.domain.rules import RulesConfig
+from src.workflow.engine import run_workflow
+
+RULES = RulesConfig(
+    minimum_credit_score=650,
+    manager_approval_threshold=500_000_000,
+    income_multiplier=20,
+    manual_review_min_score=500,
+    manual_review_max_score=649,
+)
+
+
+def make_loan(**overrides) -> Loan:
+    base = dict(
+        loan_id="L-1",
+        customer_id="C-1001",
+        amount=1_000_000,
+        phone="09121234567",
+        loan_type=LoanType.PERSONAL.value,
+        monthly_income=50_000_000,
+        credit_score=700,
+        has_guarantor=False,
+        status=LoanStatus.SUBMITTED,
+        current_stage=Stage.VALIDATION.value,
+    )
+    base.update(overrides)
+    return Loan(**base)
+
+
+def run(loan):
+    steps_seen = []
+
+    def on_step(current_loan, entry):
+        steps_seen.append((entry.stage, entry.result))
+
+    result_loan = run_workflow(loan, RULES, on_step)
+    return result_loan, steps_seen
+
+
+def test_personal_loan_happy_path_is_approved_without_manager_approval():
+    loan = make_loan(amount=1_000_000, credit_score=700)
+    result, steps = run(loan)
+    assert result.status == LoanStatus.APPROVED
+    assert result.current_stage is None
+    assert [s for s, _ in steps] == ["VALIDATION", "CHECK_FRAUD", "CHECK_CREDIT"]
+
+
+def test_personal_loan_over_threshold_requires_manager_approval():
+    loan = make_loan(amount=600_000_000, monthly_income=50_000_000, credit_score=700)
+    result, steps = run(loan)
+    assert result.status == LoanStatus.APPROVED
+    assert [s for s, _ in steps] == [
+        "VALIDATION",
+        "CHECK_FRAUD",
+        "CHECK_CREDIT",
+        "APPROVAL_MANAGER",
+    ]
+
+
+def test_invalid_data_is_rejected_at_validation_and_stops_immediately():
+    loan = make_loan(amount=-1)
+    result, steps = run(loan)
+    assert result.status == LoanStatus.REJECTED
+    assert result.current_stage is None
+    assert [s for s, _ in steps] == ["VALIDATION"]
+
+
+def test_fraud_customer_is_rejected_and_credit_check_never_runs():
+    loan = make_loan(customer_id="FRAUD-99")
+    result, steps = run(loan)
+    assert result.status == LoanStatus.REJECTED
+    assert [s for s, _ in steps] == ["VALIDATION", "CHECK_FRAUD"]
+
+
+def test_review_customer_halts_in_manual_review():
+    loan = make_loan(customer_id="REVIEW-99")
+    result, steps = run(loan)
+    assert result.status == LoanStatus.MANUAL_REVIEW
+    assert result.current_stage is None
+    assert [s for s, _ in steps] == ["VALIDATION", "CHECK_FRAUD"]
+
+
+def test_business_loan_runs_guarantor_check():
+    loan = make_loan(loan_type=LoanType.BUSINESS.value, has_guarantor=True, credit_score=700)
+    result, steps = run(loan)
+    assert result.status == LoanStatus.APPROVED
+    assert [s for s, _ in steps] == [
+        "VALIDATION",
+        "CHECK_FRAUD",
+        "CHECK_GUARANTOR",
+        "CHECK_CREDIT",
+    ]
+
+
+def test_business_loan_without_guarantor_is_rejected():
+    loan = make_loan(loan_type=LoanType.BUSINESS.value, has_guarantor=False)
+    result, steps = run(loan)
+    assert result.status == LoanStatus.REJECTED
+    assert [s for s, _ in steps] == ["VALIDATION", "CHECK_FRAUD", "CHECK_GUARANTOR"]
+
+
+def test_resuming_from_a_persisted_current_stage_skips_completed_stages():
+    # Simulate a loan that already completed VALIDATION and CHECK_FRAUD in a
+    # previous (interrupted) run -- current_stage points at CHECK_CREDIT.
+    loan = make_loan(status=LoanStatus.IN_PROGRESS, current_stage=Stage.CHECK_CREDIT.value)
+    result, steps = run(loan)
+    assert result.status == LoanStatus.APPROVED
+    assert [s for s, _ in steps] == ["CHECK_CREDIT"]
